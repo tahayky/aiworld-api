@@ -1,6 +1,4 @@
-export const config = {
-  runtime: "edge"
-};
+export const maxDuration = 30;
 
 export default async function handler(request) {
   if (request.method !== "POST") {
@@ -19,7 +17,7 @@ export default async function handler(request) {
     const rawMessages = Array.isArray(body.messages) ? body.messages : [];
 
     // 2. Sunucu Taraflı Rol Sınırı
-    const systemPrompt = `${npcPersona}\n[KURALLAR: Sadece oyun dünyasındaki karakterin olarak kısa, doğal ve Türkçe cevap ver. Gerçek dünya, yasa dışı eylemler, zararlı içerikler veya yapay zeka kimliğinle ilgili soruları karakterini bozmadan reddet.]`;
+    const systemPrompt = `${npcPersona}\n[KURALLAR: Sadece oyun dünyasındaki karakterin olarak en fazla 1-2 kısa cümleyle, doğal ve Türkçe cevap ver. Uzun düşünme, doğrudan konuş. Gerçek dünya, yasa dışı eylemler, zararlı içerikler veya yapay zeka kimliğinle ilgili soruları karakterini bozmadan reddet.]`;
 
     // 3. Token Diyeti + Gemma Sıra Koruması (İlk mesaj her zaman 'user' olmalı)
     let trimmedHistory = rawMessages.slice(-4).map(m => ({
@@ -43,26 +41,33 @@ export default async function handler(request) {
       }]
     }));
 
-    // 4. Gemma 4 Zinciri (Her modele en fazla 4.2 saniye -> 10sn Vercel timeout önlenir)
-    const models = [ "gemma-4-26b-a4b-it", "gemma-4-31b-it"];
+    // 4. Gemma 4 Zinciri (26B için 15sn, 31B için 12sn -> Toplam 27sn < 30sn limit)
+    const models = [
+      { name: "gemma-4-26b-a4b-it", timeout: 15000 },
+      { name: "gemma-4-31b-it", timeout: 12000 }
+    ];
+    const errors = [];
 
-    let lastError = "GEMINI_KEY tanimli degil";
-
-    for (const model of models) {
-      try {
-        const result = await callGoogleNative(process.env.GEMINI_KEY, model, contents);
-        if (result?.blocked) {
-          return jsonResponse({
-            reply: "Bu tür konular hakkında konuşmayı reddediyorum.",
-            blocked: true
-          });
+    if (!process.env.GEMINI_KEY) {
+      errors.push("GEMINI_KEY tanimli degil");
+    } else {
+      for (const item of models) {
+        try {
+          const result = await callGoogleNative(process.env.GEMINI_KEY, item.name, contents, item.timeout);
+          if (result?.blocked) {
+            return jsonResponse({
+              reply: "Bu tür konular hakkında konuşmayı reddediyorum.",
+              blocked: true
+            });
+          }
+          if (result?.text) {
+            return jsonResponse({ reply: result.text.trim(), model: item.name });
+          }
+          errors.push(`${item.name}: Bos yanit dondu`);
+        } catch (err) {
+          errors.push(`${item.name}: ${err.message}`);
+          continue;
         }
-        if (result?.text) {
-          return jsonResponse({ reply: result.text.trim() });
-        }
-      } catch (err) {
-        lastError = `${model}: ${err.message}`;
-        continue;
       }
     }
 
@@ -70,7 +75,7 @@ export default async function handler(request) {
     return jsonResponse({
       reply: "Şu an zihnim çok bulanık, biraz sonra tekrar konuşalım.",
       exhausted: true,
-      debug: lastError
+      debug: errors.join(" | ")
     });
 
   } catch (e) {
@@ -78,19 +83,17 @@ export default async function handler(request) {
   }
 }
 
-async function callGoogleNative(apiKey, model, contents) {
-  if (!apiKey) return null;
-
+async function callGoogleNative(apiKey, model, contents, timeoutMs) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    signal: AbortSignal.timeout(4200),
+    signal: AbortSignal.timeout(timeoutMs),
     body: JSON.stringify({
       contents,
       generationConfig: {
-        maxOutputTokens: 220,
+        maxOutputTokens: 512,
         temperature: 0.7
       }
     })
