@@ -1,10 +1,6 @@
 export const maxDuration = 30;
 
-export default async function handler(request) {
-  if (request.method !== "POST") {
-    return new Response("Method Not Allowed", { status: 405 });
-  }
-
+export async function POST(request) {
   // 1. İstemci Şifre Kontrolü
   const appSecret = request.headers.get("X-App-Secret");
   if (process.env.APP_SECRET && appSecret !== process.env.APP_SECRET) {
