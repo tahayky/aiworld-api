@@ -23,11 +23,11 @@ export default async function handler(request) {
 
     // 3. Token Diyeti + Gemma Sıra Koruması (İlk mesaj her zaman 'user' olmalı)
     let trimmedHistory = rawMessages.slice(-4).map(m => ({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: String(m.content || "").slice(0, 250)
+      role: m.role === "assistant" ? "model" : "user",
+      text: String(m.content || "").slice(0, 250)
     }));
 
-    if (trimmedHistory[0]?.role === "assistant") {
+    if (trimmedHistory[0]?.role === "model") {
       trimmedHistory = trimmedHistory.slice(1);
     }
 
@@ -35,17 +35,22 @@ export default async function handler(request) {
       return jsonResponse({ reply: "..." });
     }
 
-    // Talimatı ilk kullanıcı mesajına göm (Gemma API 400 hatasını önler)
-    const messages = trimmedHistory.map((m, idx) =>
-      idx === 0 ? { role: "user", content: `[Talimat: ${systemPrompt}]\n\n${m.content}` } : m
-    );
+    // Talimatı ilk kullanıcı mesajına göm ve Google yerel formatına çevir
+    const contents = trimmedHistory.map((m, idx) => ({
+      role: m.role,
+      parts: [{
+        text: idx === 0 ? `[Talimat: ${systemPrompt}]\n\n${m.text}` : m.text
+      }]
+    }));
 
-    // 4. Gemma 4 Zinciri (Önce 31B, kota dolunca 26B)
-    const models = ["gemma-4-31b-it", "gemma-4-26b-it"];
+    // 4. Gemma 4 Zinciri (Her modele en fazla 4.2 saniye -> 10sn Vercel timeout önlenir)
+    const models = [ "gemma-4-26b-a4b-it", "gemma-4-31b-it"];
+
+    let lastError = "GEMINI_KEY tanimli degil";
 
     for (const model of models) {
       try {
-        const result = await callGeminiEndpoint(process.env.GEMINI_KEY, model, messages);
+        const result = await callGoogleNative(process.env.GEMINI_KEY, model, contents);
         if (result?.blocked) {
           return jsonResponse({
             reply: "Bu tür konular hakkında konuşmayı reddediyorum.",
@@ -56,14 +61,16 @@ export default async function handler(request) {
           return jsonResponse({ reply: result.text.trim() });
         }
       } catch (err) {
+        lastError = `${model}: ${err.message}`;
         continue;
       }
     }
 
-    // 5. Tüm günlük kotalar dolduysa yedek cevap
+    // 5. Tüm günlük kotalar dolduysa veya hata oluştuysa yedek cevap
     return jsonResponse({
       reply: "Şu an zihnim çok bulanık, biraz sonra tekrar konuşalım.",
-      exhausted: true
+      exhausted: true,
+      debug: lastError
     });
 
   } catch (e) {
@@ -71,34 +78,38 @@ export default async function handler(request) {
   }
 }
 
-async function callGeminiEndpoint(apiKey, model, messages) {
+async function callGoogleNative(apiKey, model, contents) {
   if (!apiKey) return null;
 
-  const res = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(4200),
     body: JSON.stringify({
-      model,
-      messages,
-      max_tokens: 220,
-      temperature: 0.7
+      contents,
+      generationConfig: {
+        maxOutputTokens: 220,
+        temperature: 0.7
+      }
     })
   });
 
-  if (res.status === 422) return { blocked: true };
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`HTTP ${res.status} - ${errText.slice(0, 180)}`);
+  }
 
   const data = await res.json();
-  const choice = data?.choices?.[0];
+  const candidate = data?.candidates?.[0];
 
-  if (choice?.finish_reason === "content_filter") {
+  if (candidate?.finishReason === "SAFETY" || data?.promptFeedback?.blockReason) {
     return { blocked: true };
   }
 
-  return choice?.message?.content ? { text: choice.message.content } : null;
+  const replyText = candidate?.content?.parts?.map(p => p.text || "").join("") || "";
+  return replyText ? { text: replyText } : null;
 }
 
 function jsonResponse(obj, status = 200) {
